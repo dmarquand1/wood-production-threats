@@ -1,0 +1,124 @@
+# =============================================================================
+# SCRIPT: CALCULATE BIRD SPECIES RANGE SIZES
+#
+# Description:
+# This script calculates the total range size (in km2) for bird species.
+# It uses an Equal Area projection to ensure accurate area calculation,
+# based on the methodology of the inspiration script.
+# =============================================================================
+
+# --- 1. SETUP: Load necessary libraries ---
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  dplyr,          # For data manipulation
+  sf,             # For working with spatial vector data
+  units,           # For handling measurement units
+  here
+)
+
+# --- 2. DEFINE PROJECTION ---
+# We use the Mollweide equal area projection from the source script.
+# This is crucial: Standard Lat/Lon (WGS84) distorts area, making high-latitude
+# ranges appear larger than they are.
+moll_crs <- "+proj=moll +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+
+# --- 3. LOAD DATA ---
+analysis_df <- read.csv("data/processed/traits/bird/bird_trait_data_matched.csv")
+bird_ranges <- readRDS(here("data/processed/ranges/all_bird_ranges_dissolved.rds")) %>%
+  filter(sci_name %in% analysis_df$Trait_Name)
+
+# Get list of unique species
+species_list <- unique(bird_ranges$sci_name)
+total_species <- length(species_list)
+
+# Initialize an empty list to store results (more efficient than growing a dataframe)
+results_list <- list()
+
+# --- 4. THE LOOP ---
+cat("--- Starting Range Size Calculation for", total_species, "Species ---\n")
+
+start_time <- Sys.time()
+
+for (i in 1:total_species) {
+  
+  # A. Get current species name
+  current_species_name <- species_list[i]
+  
+  # B. Filter the spatial data for just this species
+  single_species_sf <- bird_ranges %>% 
+    filter(sci_name == current_species_name)
+  
+  # C. Transform to Equal Area Projection (The "Inspiration" Logic)
+  # This matches the 'st_transform' logic in the source script's raster function
+  species_transformed <- st_transform(single_species_sf, crs = moll_crs)
+  
+  # D. Calculate Area
+  # st_area returns area in square meters (because proj is in meters)
+  # We sum it in case the range is split into multiple polygons
+  area_m2 <- sum(st_area(species_transformed))
+  
+  # E. Convert to square kilometers for readability
+  area_km2 <- set_units(area_m2, km^2)
+  
+  # F. Store in the list
+  results_list[[i]] <- data.frame(
+    species_name = current_species_name,
+    range_size_km2 = as.numeric(area_km2)
+  )
+  
+  # G. Progress Update (Styled like the source script)
+  if (i %% 10 == 0 || i == total_species) { # Update every 10 species or at the end
+    elapsed_time <- difftime(Sys.time(), start_time, units = "mins")
+    avg_time <- as.numeric(elapsed_time) / i
+    est_remain <- round(avg_time * (total_species - i), 1)
+    
+    cat(paste0(" -> Processed ", i, " of ", total_species, 
+               " | ", current_species_name, 
+               " | Est. Remaining: ", est_remain, " mins\n"))
+  }
+}
+
+# --- 5. FINALIZE OUTPUT ---
+# Combine the list into a single clean Dataframe
+final_range_sizes <- do.call(rbind, results_list)
+final_range_sizes$log_range_size = log10(final_range_sizes$range_size_km2) %>% 
+  scale()
+hist(final_range_sizes$log_range_size)
+
+# View the top of the dataframe
+print(head(final_range_sizes))
+
+
+cat("\nCalculation Complete.\n")
+
+traits = read.csv("data/processed/traits/bird/bird_trait_data_matched.csv")
+
+if ("phylo_match" %in% names(traits)) {
+  traits <- traits %>% mutate(phylo_match = gsub(" ", "_", phylo_match))
+} else if ("Tree_Name" %in% names(traits)) {
+  traits <- traits %>%
+    rename(phylo_match = Tree_Name) %>%
+    mutate(phylo_match = gsub(" ", "_", phylo_match))
+} else {
+  stop("bird_trait_data_matched.csv is missing the matched tree-tip column ('phylo_match'/'Tree_Name'). Run 01_prepare_data.R first.")
+}
+
+library(dplyr)
+
+traits <- traits %>%
+  left_join(final_range_sizes %>% select(species_name, log_range_size), 
+            by = c("Trait_Name" = "species_name"))
+
+# Add range size to the trait data
+model_data = read.csv("data/processed/traits/bird/bird_traits_imputed_ready.csv") %>%
+  left_join(traits %>% select(phylo_match, log_range_size,
+                              Threat_Logging, Threat_Plantation, Trait_Name),
+            by = c("species" = "phylo_match"))
+  
+# Make sure the trait data has the trait and phylogeny names
+model_data <- model_data %>% 
+  rename(phylo_name = species) %>% 
+  rename(spatial_name = "Trait_Name")
+
+write.csv(model_data, file="data/processed/traits/bird/bird_trait_model_final_data.csv")
+
